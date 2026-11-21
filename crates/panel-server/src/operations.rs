@@ -21,6 +21,14 @@ pub struct Operations {
     /// a fake one that answers from a file
     #[cfg_attr(not(unix), allow(dead_code))]
     systemctl: Arc<str>,
+    /// procd 环境下的服务 pid 文件；Some 时用它读状态，不再调 systemctl
+    /// The service pid file under procd; when Some, status is read from it instead of systemctl
+    #[cfg_attr(not(unix), allow(dead_code))]
+    service_pidfile: Option<PathBuf>,
+    /// procd 环境下的服务日志文件；Some 时日志页读它，不再调 journalctl
+    /// The service log file under procd; when Some, the log page reads it instead of journalctl
+    #[cfg_attr(not(unix), allow(dead_code))]
+    service_logfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,7 +213,18 @@ impl Operations {
             service_helper_socket,
             diagnostic_server,
             systemctl: Arc::from("systemctl"),
+            service_pidfile: None,
+            service_logfile: None,
         })
+    }
+
+    /// 切到 procd 后端：状态读 pid 文件、日志读日志文件（OpenWrt 上没有 systemd）
+    /// Switch to the procd backend: status from a pid file, logs from a log file (no systemd on OpenWrt)
+    #[must_use]
+    pub fn with_procd_service(mut self, pidfile: Option<PathBuf>, logfile: Option<PathBuf>) -> Self {
+        self.service_pidfile = pidfile;
+        self.service_logfile = logfile;
+        self
     }
 
     #[must_use]
@@ -216,6 +235,9 @@ impl Operations {
 
     #[cfg(unix)]
     pub async fn service_status(&self) -> Result<ServiceStatus, OperationError> {
+        if let Some(pidfile) = &self.service_pidfile {
+            return procd_service_status(self.service_unit.as_ref(), pidfile);
+        }
         let output = run_command(
             &self.systemctl,
             &[
@@ -332,6 +354,9 @@ impl Operations {
         level: Option<LogLevel>,
     ) -> Result<LogPage, OperationError> {
         let limit = limit.clamp(1, 500);
+        if let Some(logfile) = self.service_logfile.clone() {
+            return procd_logs(&logfile, limit, before_cursor, level);
+        }
         let arguments = journal_arguments(self.service_unit.as_ref(), limit, before_cursor, level);
         let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         // unit 状态和日志本身并行查：多一次 systemctl 不该让日志页慢一倍。
@@ -489,6 +514,165 @@ async fn run_command(
     }
     String::from_utf8(output.stdout)
         .map_err(|_| OperationError::Failed(format!("{program} 输出不是 UTF-8")))
+}
+
+/// procd 后端的状态：pid 文件里的进程还活着就是 active，否则 inactive。
+/// procd status: active while the pid from the pid file still exists, inactive otherwise.
+#[cfg(unix)]
+fn procd_service_status(unit: &str, pidfile: &std::path::Path) -> Result<ServiceStatus, OperationError> {
+    let pid = std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .filter(|pid| *pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists());
+    let running = pid.is_some();
+    Ok(ServiceStatus {
+        unit: unit.to_owned(),
+        active_state: if running { "active" } else { "inactive" }.to_owned(),
+        sub_state: if running { "running" } else { "dead" }.to_owned(),
+        main_pid: pid.unwrap_or(0),
+        did_not_come_up: false,
+        restart_rollback: None,
+        pending_writable: None,
+    })
+}
+
+/// 从日志文件取一页，新的在前。游标是行的字节偏移：翻旧页时只取偏移更小的行。
+/// One page from the log file, newest first. The cursor is a line's byte offset:
+/// older pages only take lines with a smaller offset.
+#[cfg(unix)]
+fn procd_logs(
+    logfile: &std::path::Path,
+    limit: usize,
+    before_cursor: Option<&str>,
+    level: Option<LogLevel>,
+) -> Result<LogPage, OperationError> {
+    const MAX_READ: u64 = 8 * 1024 * 1024;
+    let bytes = std::fs::read(logfile).unwrap_or_default();
+    let bytes = if bytes.len() as u64 > MAX_READ {
+        &bytes[bytes.len() - MAX_READ as usize..]
+    } else {
+        &bytes[..]
+    };
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+    let cursor_offset = before_cursor.and_then(|value| value.parse::<usize>().ok());
+    let mut entries: Vec<(usize, LogEntry)> = lines
+        .into_iter()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .rev()
+        .filter(|(start, _)| cursor_offset.is_none_or(|cursor| *start < cursor))
+        .filter_map(|(start, line)| {
+            let (timestamp_unix_micros, priority, message) = parse_log_line(line);
+            if let Some(wanted) = level {
+                let matched = match wanted {
+                    LogLevel::Error => priority <= 3,
+                    LogLevel::Warning => priority == 4,
+                    LogLevel::Info => priority >= 5,
+                };
+                if !matched {
+                    return None;
+                }
+            }
+            Some((
+                start,
+                LogEntry {
+                    timestamp_unix_micros,
+                    priority,
+                    source: "kixdns".to_owned(),
+                    message: truncate(message, 4_096),
+                },
+            ))
+        })
+        .collect();
+    let has_more = entries.len() > limit;
+    entries.truncate(limit);
+    let next_cursor = has_more.then(|| entries.last().map(|(start, _)| start.to_string())).flatten();
+    Ok(LogPage {
+        entries: entries.into_iter().map(|(_, entry)| entry).collect(),
+        next_cursor,
+        notice: None,
+    })
+}
+
+/// 解析 `2026-11-21T20:00:00.123456Z  INFO kixdns: ...` 这种 tracing 行；
+/// 认不出时间戳就记 0，级别按关键字粗判（tracing 的 INFO/WARN/ERROR）。
+/// Parses a tracing line like `2026-11-21T20:00:00.123456Z  INFO kixdns: ...`;
+/// an unparsable timestamp becomes 0 and the level is guessed from the keyword.
+#[cfg(unix)]
+fn parse_log_line(line: &str) -> (u64, u8, &str) {
+    let mut rest = line.trim_start();
+    let mut timestamp = 0u64;
+    if let Some((head, tail)) = rest.split_once(char::is_whitespace) {
+        timestamp = timestamp_micros(head);
+        if timestamp > 0 {
+            rest = tail.trim_start();
+        }
+    }
+    let priority = if rest.contains("ERROR") || rest.contains("error") {
+        3
+    } else if rest.contains("WARN") || rest.contains("warn") {
+        4
+    } else {
+        6
+    };
+    (timestamp, priority, rest)
+}
+
+/// `2026-11-21T20:00:00.123456Z` / `...123Z` / `...T20:00:00Z` → 微秒时间戳；失败返回 0。
+#[cfg(unix)]
+fn timestamp_micros(value: &str) -> u64 {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20 || bytes.get(4) != Some(&b'-') || bytes.get(7) != Some(&b'-') {
+        return 0;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        value.get(range).and_then(|part| part.parse::<i64>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        number(0..4),
+        number(5..7),
+        number(8..10),
+        number(11..13),
+        number(14..16),
+        number(17..19),
+    ) else {
+        return 0;
+    };
+    let mut micros_fraction = 0i64;
+    if let Some(dot) = value.find('.') {
+        let fraction = value[dot + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .take(6)
+            .collect::<String>();
+        if !fraction.is_empty() {
+            let scale = 10i64.pow(6 - fraction.len() as u32);
+            micros_fraction = fraction.parse::<i64>().unwrap_or(0) * scale;
+        }
+    }
+    let days = days_from_civil(year, month, day);
+    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    u64::try_from(seconds * 1_000_000 + micros_fraction).unwrap_or(0)
+}
+
+/// Howard Hinnant 的 days_from_civil，避免为一行日志拉一个日期库。
+#[cfg(unix)]
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(unix)]
